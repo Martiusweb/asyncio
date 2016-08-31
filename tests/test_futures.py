@@ -387,7 +387,23 @@ class FutureTests(test_utils.TestCase):
         self.check_future_exception_never_retrieved(False)
 
     def test_future_exception_never_retrieved_debug(self):
+        # TODO this must be way better before it can land, we now have more
+        # cases to handle (what if the reference is deleted before the call,
+        # etc)
+        callback_called = False
+
+        def gen():
+            when = yield 0
+            if when == 2:
+                nonlocal callback_called
+                callback_called = True
+            # last call
+            yield 0
+
+        self.loop._gen = gen()
+        next(self.loop._gen)
         self.check_future_exception_never_retrieved(True)
+        self.assertTrue(callback_called)
 
     def test_set_result_unless_cancelled(self):
         from asyncio import futures

@@ -10,6 +10,7 @@ import logging
 import reprlib
 import sys
 import traceback
+import weakref
 
 from . import compat
 from . import events
@@ -24,6 +25,9 @@ CancelledError = concurrent.futures.CancelledError
 TimeoutError = concurrent.futures.TimeoutError
 
 STACK_DEBUG = logging.DEBUG - 1  # heavy-duty debugging
+
+# Timeout after which an exception not retrieved yet is logged, in debug mode.
+DEBUG_UNRETRIEVED_EXCEPTION_TIMEOUT = 2
 
 
 class InvalidStateError(Error):
@@ -80,13 +84,26 @@ class _TracebackLogger:
     in a discussion about closing files when they are collected.
     """
 
-    __slots__ = ('loop', 'source_traceback', 'exc', 'tb')
+    __slots__ = ('loop', 'source_traceback', 'exc', 'tb', 'debug_handle')
 
     def __init__(self, future, exc):
         self.loop = future._loop
         self.source_traceback = future._source_traceback
         self.exc = exc
         self.tb = None
+
+        if self.loop.get_debug():
+            self.debug_handle = self.loop.call_later(
+                DEBUG_UNRETRIEVED_EXCEPTION_TIMEOUT,
+                self.loop.call_exception_handler,
+                self.format_message('Future/Task exception was not yet '
+                                    'retrieved, did you forget to yield '
+                                    'from it?\n')
+            )
+            # Don't let the handle keep a reference to this object
+            self.debug_handle._source_traceback = None
+        else:
+            self.debug_handle = None
 
     def activate(self):
         exc = self.exc
@@ -98,16 +115,23 @@ class _TracebackLogger:
     def clear(self):
         self.exc = None
         self.tb = None
+        if self.debug_handle is not None:
+            self.debug_handle.cancel()
+            self.debug_handle = None
+
+    def format_message(self, msg):
+        if self.source_traceback:
+            src = ''.join(traceback.format_list(self.source_traceback))
+            msg += 'Future/Task created at (most recent call last):\n'
+            msg += '%s\n' % src.rstrip()
+        msg += ''.join(self.tb).rstrip()
+        return msg
 
     def __del__(self):
         if self.tb:
-            msg = 'Future/Task exception was never retrieved\n'
-            if self.source_traceback:
-                src = ''.join(traceback.format_list(self.source_traceback))
-                msg += 'Future/Task created at (most recent call last):\n'
-                msg += '%s\n' % src.rstrip()
-            msg += ''.join(self.tb).rstrip()
-            self.loop.call_exception_handler({'message': msg})
+            self.loop.call_exception_handler({'message': self.format_message(
+                'Future/Task exception was never retrieved\n')})
+        self.clear()
 
 
 class Future:
@@ -137,6 +161,7 @@ class Future:
     _blocking = False  # proper use of future (yield vs yield from)
 
     _log_traceback = False   # Used for Python 3.4 and later
+    _tb_debug_handle = None  # Used fro Python 3.4 and later
     _tb_logger = None        # Used for Python 3.3 only
 
     def __init__(self, *, loop=None):
@@ -198,20 +223,40 @@ class Future:
     # cycle are never destroyed. It's not more the case on Python 3.4 thanks
     # to the PEP 442.
     if compat.PY34:
-        def __del__(self):
-            if not self._log_traceback:
-                # set_exception() was not called, or result() or exception()
-                # has consumed the exception
+        @staticmethod
+        def _warn_unretrieved_exception(fut):
+            # fut is a weakref to self: we don't want the callback to be the
+            # last referer to the future preventing it to be collected.
+            fut = fut()
+            if fut is None:
                 return
+
+            context = fut._format_context(
+                '%%s exception was not retrieved after %d seconds, did your '
+                'forget to await it?' % DEBUG_UNRETRIEVED_EXCEPTION_TIMEOUT)
+            fut._loop.call_exception_handler(context)
+
+        def _format_context(self, message):
             exc = self._exception
             context = {
-                'message': ('%s exception was never retrieved'
-                            % self.__class__.__name__),
+                'message': (message % self.__class__.__name__),
                 'exception': exc,
                 'future': self,
             }
             if self._source_traceback:
                 context['source_traceback'] = self._source_traceback
+
+            return context
+
+        def __del__(self):
+            if not self._log_traceback:
+                # set_exception() was not called, or result() or exception()
+                # has consumed the exception
+                return
+            if self._tb_debug_handle is not None:
+                self._tb_debug_handle.cancel()
+                self._tb_debug_handle = None
+            context = self._format_context('%s exception was never retrieved')
             self._loop.call_exception_handler(context)
 
     def cancel(self):
@@ -267,6 +312,9 @@ class Future:
         if self._state != _FINISHED:
             raise InvalidStateError('Result is not ready.')
         self._log_traceback = False
+        if self._tb_debug_handle is not None:
+            self._tb_debug_handle.cancel()
+            self._tb_debug_handle = None
         if self._tb_logger is not None:
             self._tb_logger.clear()
             self._tb_logger = None
@@ -287,6 +335,9 @@ class Future:
         if self._state != _FINISHED:
             raise InvalidStateError('Exception is not set.')
         self._log_traceback = False
+        if self._tb_debug_handle is not None:
+            self._tb_debug_handle.cancel()
+            self._tb_debug_handle = None
         if self._tb_logger is not None:
             self._tb_logger.clear()
             self._tb_logger = None
@@ -349,6 +400,12 @@ class Future:
         self._schedule_callbacks()
         if compat.PY34:
             self._log_traceback = True
+            if self._loop.get_debug():
+                self._tb_debug_handle = self._loop.call_later(
+                    DEBUG_UNRETRIEVED_EXCEPTION_TIMEOUT,
+                    self._warn_unretrieved_exception,
+                    weakref.ref(self))
+                self._tb_debug_handle._source_traceback = None
         else:
             self._tb_logger = _TracebackLogger(self, exception)
             # Arrange for the logger to be activated after all callbacks
